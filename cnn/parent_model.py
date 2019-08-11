@@ -9,8 +9,7 @@ from torch.autograd import Variable
 from genotypes import PRIMITIVES
 from genotypes import Genotype
 
-from child_model import *
-
+# from child_model import *
 def initialize_gradients(model, optimizer):
     optimizer.zero_grad()
     input = torch.ones(3, 3, 32, 32).float()

@@ -12,6 +12,9 @@ import argparse
 from tensorboardX import SummaryWriter
 from tqdm import tqdm
 
+from child_model import *
+from parent_model import *
+
 parser = argparse.ArgumentParser("cifar")
 parser.add_argument('--data', type=str, default='../data', help='location of the data corpus')
 parser.add_argument('--batch_size', type=int, default=64, help='batch size')
@@ -23,7 +26,7 @@ parser.add_argument('--report_freq', type=float, default=50, help='report freque
 parser.add_argument('--gpu', type=int, default=0, help='gpu device id')
 parser.add_argument('--epochs', type=int, default=300, help='num of training epochs')
 parser.add_argument('--init_channels', type=int, default=16, help='num of init channels')
-parser.add_argument('--layers', type=int, default=8, help='total number of layers')
+parser.add_argument('--layers', type=int, default=4, help='total number of layers')
 parser.add_argument('--model_path', type=str, default='saved_models', help='path to save the model')
 parser.add_argument('--cutout', action='store_true', default=False, help='use cutout')
 parser.add_argument('--cutout_length', type=int, default=16, help='cutout length')
@@ -41,16 +44,8 @@ args = parser.parse_args()
 
 CIFAR_CLASSES = 10
 
-def random_sample(cell_shape):
-    weights = torch.zeros(cell_shape)
-    for i in range(cell_shape[0]):
-        choice = np.random.randint(cell_shape[1])
-        weights[i, choice] = 1
-    weights = weights.float().cuda()
-    return weights
-
-def train_one_path(train_queue, valid_queue, model, criterion, optimizer):
-    for step, (input, target) in enumerate(train_queue):
+def train(train_queue, valid_queue, model, criterion, optimizer):
+    for step, (input, target) in enumerate(tqdm(train_queue)):
         model.train()
         n = input.size(0)
 
@@ -64,26 +59,6 @@ def train_one_path(train_queue, valid_queue, model, criterion, optimizer):
         loss.backward()
         nn.utils.clip_grad_norm(model.parameters(), args.grad_clip)
         optimizer.step()
-
-def accumulate_gradient(train_queue, valid_queue, model, criterion, optimizer):
-    optimizer.zero_grad()
-    for step, (input, target) in enumerate(train_queue):
-        model.train()
-        n = input.size(0)
-
-        input = Variable(input, requires_grad=False).cuda()
-        target = Variable(target, requires_grad=False).cuda()
-
-        logits = model(input)
-        loss = criterion(logits, target)
-
-        loss.backward()
-
-def add_gradient(target_model, reference_model, beta):
-    for paramName, paramValue, in reference_model.named_parameters():
-        for netCopyName, netCopyValue, in target_model.named_parameters():
-            if paramName == netCopyName:
-                netCopyValue.grad += beta * paramValue.grad.clone()
 
 def validate(valid_queue, model, criterion):
     objs = utils.AvgrageMeter()
@@ -107,29 +82,16 @@ def validate(valid_queue, model, criterion):
     return top1.avg, objs.avg
 
 if __name__ == '__main__':
-    # criterion = nn.CrossEntropyLoss()
-    # model = Network(16, 10, 8, criterion)
-    # print(model.alphas_normal.shape)
-    # print(model.alphas_reduce.shape)
-    writer = SummaryWriter()
-    np.random.seed(args.seed)
-    torch.cuda.set_device(args.gpu)
-    #cudnn.benchmark = True
-    torch.manual_seed(args.seed)
-    #cudnn.enabled=True
-    torch.cuda.manual_seed(args.seed)
-
     criterion = nn.CrossEntropyLoss()
     criterion = criterion.cuda()
 
-    model = Network(args.init_channels, CIFAR_CLASSES, args.layers, criterion, None)
-    model = model.cuda()
-
+    super_graph = SuperNetwork(args.init_channels, CIFAR_CLASSES, args.layers)
     optimizer = torch.optim.SGD(
-        model.parameters(),
+        super_graph.parameters(),
         args.learning_rate,
         momentum=args.momentum,
         weight_decay=args.weight_decay)
+    initialize_gradients(super_graph, optimizer)
 
     train_transform, valid_transform = utils._data_transforms_cifar10(args)
     train_data = dset.CIFAR10(root=args.data, train=True, download=True, transform=train_transform)
@@ -148,49 +110,25 @@ if __name__ == '__main__':
         sampler=torch.utils.data.sampler.SubsetRandomSampler(indices[split:num_train]),
         pin_memory=True, num_workers=2)
 
-    # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-    #     optimizer, float(args.epochs), eta_min=args.learning_rate_min)
+    sampled_architecture = random_sample((args.layers, sum(1 for i in range(4) for n in range(2+i)))).astype(int)
+    child_graph = ChildNetwork(args.init_channels, CIFAR_CLASSES, args.layers, sampled_architecture)
+    child_optimizer = torch.optim.SGD(
+        child_graph.parameters(),
+        args.learning_rate,
+        momentum=args.momentum,
+        weight_decay=args.weight_decay)
+    initialize_gradients(child_graph, child_optimizer)
+    child_graph = child_graph.cuda()
 
-    for epoch in range(args.epochs):
-        print("Current epoch: {}".format(epoch))
-        optimizer.zero_grad()
-        avg_acc, avg_loss = 0.0, 0.0
-        model_buffer = []
-        optimizer_buffer = []
-        for sample in range(args.num_samples):
-            cell_shape = (sum(1 for i in range(4) for n in range(2+i)), len(PRIMITIVES))
-            sampled_weights = random_sample(cell_shape)
-            model_buffer.append(Network(args.init_channels, CIFAR_CLASSES, args.layers, criterion, sampled_weights).cuda())
-            optimizer_buffer.append(torch.optim.SGD(model_buffer[-1].parameters(), args.learning_rate, momentum=args.momentum, weight_decay=args.weight_decay))
-            for child_epoch in tqdm(range(args.child_epochs)):
-                train_one_path(train_queue, valid_queue, model_buffer[-1], criterion, optimizer_buffer[-1])
-            acc, loss = validate(valid_queue, model_buffer[-1], criterion)
-            avg_acc += acc
-            avg_loss += loss
+    for epoch in range(5):
+        train(train_queue, valid_queue, child_graph, criterion, child_optimizer)
+        acc, loss = validate(valid_queue, child_graph, criterion)
+        print("acc: {}, loss: {}".format(acc, loss))
 
-            accumulate_gradient(train_queue, valid_queue, model_buffer[-1], criterion, optimizer_buffer[-1])
-            add_gradient(target_model=model, reference_model=model_buffer[-1], beta=1/len(train_queue))
+    child_graph = child_graph.cpu()
+    copyChildToParent(super_graph, child_graph, True, False)
+    copyParentToChild(super_graph, child_graph, True, False)
 
-            del model_buffer[:]
-            del optimizer_buffer[:]
-        optimizer.step()
-
-        avg_acc /= args.num_samples
-        avg_loss /= args.num_samples
-
-        writer.add_scalar('avg_one_acc', avg_acc, epoch)
-        writer.add_scalar('avg_one_loss', avg_loss, epoch)
-
-    writer.close()
-
-    # for epoch in range(args.epochs):
-    #     scheduler.step()
-    #     lr = scheduler.get_lr()[0]
-    #
-    #     # training
-    #     train_acc, train_obj = train(train_queue, valid_queue, model, criterion, optimizer, lr, weights)
-    #
-    #     # validation
-    #     valid_acc, valid_obj = infer(valid_queue, model, criterion)
-    #
-    #     utils.save(model, os.path.join(args.save, 'weights.pt'))
+    child_graph = child_graph.cuda()
+    acc, loss = validate(valid_queue, child_graph, criterion)
+    print("acc: {}, loss: {}".format(acc, loss))
